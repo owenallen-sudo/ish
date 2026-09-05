@@ -104,7 +104,6 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         [config.userContentController addScriptMessageHandler:self name:@"resize"];
         [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
 
-        // Very large view prevents early line‑wrapping before layout.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
         _webView = [[CustomWebView alloc] initWithFrame:webviewSize
                                            configuration:config];
@@ -145,18 +144,19 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     if ([message.name isEqualToString:@"load"]) {
         self.loaded = YES;
         [self.refreshTask schedule];
-        // Preserve the current setting if it was set before the page loaded.
         self.enableVoiceOverAnnounce = self.enableVoiceOverAnnounce;
     } else if ([message.name isEqualToString:@"log"]) {
         NSLog(@"%@", message.body);
     } else if ([message.name isEqualToString:@"sendInput"]) {
+        if (![message.body isKindOfClass:[NSString class]]) return;
         NSData *data = [message.body dataUsingEncoding:NSUTF8StringEncoding];
         [self sendInput:data];
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
     } else if ([message.name isEqualToString:@"propUpdate"]) {
-        // message.body is expected to be an array: @[key, value]
-        [self setValue:message.body[1] forKey:message.body[0]];
+        if (![message.body isKindOfClass:[NSArray class]] || [(NSArray *)message.body count] < 2) return;
+        NSArray *pair = (NSArray *)message.body;
+        [self setValue:pair[1] forKey:pair[0]];
     }
 }
 
@@ -178,7 +178,9 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         unlock(&self.tty->lock);
 #else
         async_do_in_workqueue(^{
-            self->_tty->ops->resize(self->_tty, cols, rows);
+            if (self->_tty) {
+                self->_tty->ops->resize(self->_tty, cols, rows);
+            }
         });
 #endif
     }];
@@ -197,32 +199,35 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 - (int)sendOutput:(const void *)buf length:(int)len {
 #if !ISH_LINUX
     lock(&_dataLock);
-    // Never block on the main thread – drop data if the buffer is full.
     if (NSThread.isMainThread && _pendingData.length >= BUF_SIZE) {
-        // Truncate to avoid deadlock; callers can resend later if needed.
         unlock(&_dataLock);
         return 0;
     }
 
-    // Block only on background threads.
     while (!NSThread.isMainThread && _pendingData.length >= BUF_SIZE) {
         wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
     }
 
-    [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
-    [self.refreshTask schedule];
+    NSUInteger room = BUF_SIZE - _pendingData.length;
+    int written = (int)MIN((NSUInteger)len, room);
+    if (written > 0) {
+        [_pendingData appendData:[NSData dataWithBytes:buf length:written]];
+        [self.refreshTask schedule];
+    }
     unlock(&_dataLock);
+    return written;
 #else
+    int written = 0;
     @synchronized (self) {
         int room = [self roomForOutput];
-        if (len > room) len = room;
-        if (len > 0) {
-            [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
+        written = len > room ? room : len;
+        if (written > 0) {
+            [_pendingData appendData:[NSData dataWithBytes:buf length:written]];
             [self.refreshTask schedule];
         }
     }
+    return written;
 #endif
-    return len;
 }
 
 /* ---------- Linux‑specific output space ---------- */
@@ -237,13 +242,15 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 /* ---------- Input handling ---------- */
 - (void)sendInput:(NSData *)input {
+    if (input == nil) return;
     if (self.tty == NULL) return;
 #if !ISH_LINUX
     tty_input(self.tty, input.bytes, input.length, 0);
 #else
     async_do_in_workqueue(^{
-        NSData *inputRef = input;
-        self.tty->ops->send_input(self.tty, inputRef.bytes, inputRef.length);
+        if (self->_tty) {
+            self->_tty->ops->send_input(self->_tty, input.bytes, input.length);
+        }
     });
 #endif
     [self.webView evaluateJavaScript:@"exports.setUserGesture()" completionHandler:nil];
@@ -258,7 +265,6 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 /* ---------- ANSI helper ---------- */
 - (NSString *)arrow:(char)direction {
     NSAssert(direction >= 'A' && direction <= 'D', @"Invalid arrow direction: %c", direction);
-    // Only A‑D are valid; protect against unexpected values.
     if (direction < 'A' || direction > 'D') direction = 'A';
     return [NSString stringWithFormat:@"\x1b%c%c",
             self.applicationCursor ? 'O' : '[', direction];
@@ -299,17 +305,26 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     }
 #endif
 
-    // Convert to a safe string – fall back to lossy conversion if needed.
-    // NOTE: must encode the captured `data`, not self.pendingData (which
-    // has already been replaced with a fresh empty buffer above).
+    if (data.length == 0) {
+        @synchronized (self) {
+            self.outputInProgress = NO;
+        }
+        return;
+    }
+
     NSString *dataString = [[NSString alloc] initWithData:data
                                                    encoding:NSISOLatin1StringEncoding];
     if (!dataString) {
         dataString = [[NSString alloc] initWithData:data
                                             encoding:NSUTF8StringEncoding];
     }
+    if (!dataString) {
+        @synchronized (self) {
+            self.outputInProgress = NO;
+        }
+        return;
+    }
 
-    // Escape for JavaScript (Latin‑1 guarantees single‑byte characters).
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
@@ -331,27 +346,26 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 + (void)convertCommand:(NSArray<NSString *> *)command
                 toArgs:(char *)argv
              limitSize:(size_t)maxSize {
-    // Builds a sequence of NUL-terminated strings back-to-back in argv,
-    // followed by a final terminating NUL (double-NUL at the very end).
+    if (maxSize < 2) return;
+
     char *p = argv;
     char *end = argv + maxSize;
 
     for (NSString *cmd in command) {
         const char *c = cmd.UTF8String;
-        while (p < end - 1 && (*p = *c) != '\0') {
+        while (p < end - 2 && (*p = *c) != '\0') {
             p++;
             c++;
         }
-        if (p >= end - 1) {
-            // Out of space; terminate what we have so far and stop.
+        if (p >= end - 2) {
             *p = '\0';
+            if (p + 1 < end) *(p + 1) = '\0';
             return;
         }
-        *p = '\0'; // terminate this argument
-        p++;       // advance past it so the next argument doesn't overwrite it
+        *p = '\0';
+        p++;
     }
 
-    // Final double‑NUL terminator marking the end of the whole block.
     if (p < end) {
         *p = '\0';
     }
@@ -415,8 +429,6 @@ void Terminal_setLinuxTTY(nsobj_t _self, struct linux_tty *tty) {
 /* ---------- iOS tty driver ---------- */
 #if !ISH_LINUX
 static int ios_tty_init(struct tty *tty) {
-    // Release the global ttys lock; the init block may re‑acquire it via the
-    // Terminal constructor, which would deadlock otherwise.
     unlock(&ttys_lock);
 
     void (^init_block)(void) = ^{
