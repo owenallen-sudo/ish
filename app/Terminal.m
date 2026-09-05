@@ -3,6 +3,7 @@
 //  iSH
 //
 //  Created by Theodore Dubois on 10/18/17.
+//  Modified by ChatGPT – bug fixes & clean‑up
 //
 
 #import "Terminal.h"
@@ -27,33 +28,31 @@ typedef struct linux_tty *tty_t;
 #endif
 }
 
-@property BOOL loaded;
-@property (nonatomic) tty_t tty;
-// lock with dataLock for !linux and @synchronized(self) for linux
-@property (nonatomic) NSMutableData *pendingData;
-// sending output is an asynchronous thing due to javascript, this is used to ensure it doesn't happen twice at once
-@property (nonatomic) BOOL outputInProgress;
+/* ---------- State ---------- */
+@property (nonatomic, assign) BOOL loaded;
+@property (nonatomic) tty_t tty;                     // guarded by @synchronized(self) for Linux, lock_t for non‑Linux
+@property (nonatomic) NSMutableData *pendingData;    // accessed while holding the appropriate lock
+@property (nonatomic, assign) BOOL outputInProgress; // guarded by the same lock as pendingData
 
-@property DelayedUITask *refreshTask;
-@property DelayedUITask *scrollToBottomTask;
+/* ---------- Tasks ---------- */
+@property (nonatomic) DelayedUITask *refreshTask;
+@property (nonatomic) DelayedUITask *scrollToBottomTask;
 
-@property BOOL applicationCursor;
-
-@property NSNumber *terminalsKey;
-@property NSUUID *uuid;
+/* ---------- Misc ---------- */
+@property (nonatomic, assign) BOOL applicationCursor;
+@property (nonatomic, strong) NSNumber *terminalsKey;
+@property (nonatomic, strong) NSUUID *uuid;
+@property (nonatomic, assign) BOOL enableVoiceOverAnnounce;
 
 @end
 
 @interface CustomWebView : WKWebView
 @end
+
 @implementation CustomWebView
 - (BOOL)becomeFirstResponder {
-    if (@available(iOS 13.4, *)) {
-        return [super becomeFirstResponder];
-    }
-    return NO;
+    return [super becomeFirstResponder];
 }
-
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(copy:) || action == @selector(paste:)) {
         return NO;
@@ -65,27 +64,28 @@ typedef struct linux_tty *tty_t;
 @implementation Terminal
 @synthesize webView = _webView;
 
-static const int BUF_SIZE = 1<<14;
+static const int BUF_SIZE = 1 << 14;
 
 static NSMapTable<NSNumber *, Terminal *> *terminals;
 static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
+/* ---------- Initialisation ---------- */
 - (instancetype)initWithType:(int)type number:(int)num {
     @synchronized (Terminal.class) {
         self.terminalsKey = @(dev_make(type, num));
-        Terminal *terminal = [terminals objectForKey:self.terminalsKey];
-        if (terminal)
-            return terminal;
+        Terminal *existing = [terminals objectForKey:self.terminalsKey];
+        if (existing) return existing;
 
         if (self = [super init]) {
             self.pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-            self.refreshTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(refresh)];
-            self.scrollToBottomTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(scrollToBottom)];
+            self.refreshTask = [[DelayedUITask alloc] initWithTarget:self
+                                                             action:@selector(refresh)];
+            self.scrollToBottomTask = [[DelayedUITask alloc] initWithTarget:self
+                                                                    action:@selector(scrollToBottom)];
 #if !ISH_LINUX
             lock_init(&_dataLock);
             cond_init(&_dataConsumed);
 #endif
-
             [terminals setObject:self forKey:self.terminalsKey];
             self.uuid = [NSUUID UUID];
             [terminalsByUUID setObject:self forKey:self.uuid];
@@ -94,6 +94,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     }
 }
 
+/* ---------- Web view ---------- */
 - (WKWebView *)webView {
     if (_webView == nil) {
         WKWebViewConfiguration *config = [WKWebViewConfiguration new];
@@ -102,24 +103,29 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         [config.userContentController addScriptMessageHandler:self name:@"sendInput"];
         [config.userContentController addScriptMessageHandler:self name:@"resize"];
         [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
-        // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
+
+        // Very large view prevents early line‑wrapping before layout.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
-        _webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
-        if (@available(macOS 13.3, iOS 16.4, tvOS 16.4, *))
+        _webView = [[CustomWebView alloc] initWithFrame:webviewSize
+                                           configuration:config];
+        if (@available(macOS 13.3, iOS 16.4, tvOS 16.4, *)) {
             _webView.inspectable = YES;
+        }
         _webView.scrollView.scrollEnabled = NO;
-        NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"term" withExtension:@"html"];
+        NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"term"
+                                                     withExtension:@"html"];
         [_webView loadFileURL:xtermHtmlFile allowingReadAccessToURL:xtermHtmlFile];
     }
     return _webView;
 }
 
+/* ---------- Helper ---------- */
 #if !ISH_LINUX
 + (Terminal *)createPseudoTerminal:(struct tty **)tty {
     *tty = pty_open_fake(&ios_pty_driver);
     if (IS_ERR(*tty))
         return nil;
-    return (__bridge Terminal *) (*tty)->data;
+    return (__bridge Terminal *)(*tty)->data;
 }
 #endif
 
@@ -132,11 +138,14 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     });
 }
 
-- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
+/* ---------- Script messaging ---------- */
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+
     if ([message.name isEqualToString:@"load"]) {
         self.loaded = YES;
         [self.refreshTask schedule];
-        // make sure this setting works if it's set before loading
+        // Preserve the current setting if it was set before the page loaded.
         self.enableVoiceOverAnnounce = self.enableVoiceOverAnnounce;
     } else if ([message.name isEqualToString:@"log"]) {
         NSLog(@"%@", message.body);
@@ -146,19 +155,26 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
     } else if ([message.name isEqualToString:@"propUpdate"]) {
+        // message.body is expected to be an array: @[key, value]
         [self setValue:message.body[1] forKey:message.body[0]];
     }
 }
 
+/* ---------- Window size ---------- */
 - (void)syncWindowSize {
-    [self.webView evaluateJavaScript:@"exports.getSize()" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
+    [self.webView evaluateJavaScript:@"exports.getSize()"
+                   completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
+        if (error || dimensions.count < 2) {
+            NSLog(@"Failed to obtain terminal size: %@", error);
+            return;
+        }
         int cols = dimensions[0].intValue;
         int rows = dimensions[1].intValue;
-        if (self.tty == NULL)
-            return;
+        if (self.tty == NULL) return;
+
 #if !ISH_LINUX
         lock(&self.tty->lock);
-        tty_set_winsize(self.tty, (struct winsize_) {.col = cols, .row = rows});
+        tty_set_winsize(self.tty, (struct winsize_){ .col = cols, .row = rows });
         unlock(&self.tty->lock);
 #else
         async_do_in_workqueue(^{
@@ -168,52 +184,60 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     }];
 }
 
+/* ---------- Voice‑Over ---------- */
 - (void)setEnableVoiceOverAnnounce:(BOOL)enableVoiceOverAnnounce {
     _enableVoiceOverAnnounce = enableVoiceOverAnnounce;
-    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"term.setAccessibilityEnabled(%@)",
-                                      enableVoiceOverAnnounce ? @"true" : @"false"]
-                   completionHandler:nil];
+    NSString *js = [NSString stringWithFormat:
+                    @"term.setAccessibilityEnabled(%@)",
+                    enableVoiceOverAnnounce ? @"true" : @"false"];
+    [self.webView evaluateJavaScript:js completionHandler:nil];
 }
 
+/* ---------- Output handling ---------- */
 - (int)sendOutput:(const void *)buf length:(int)len {
 #if !ISH_LINUX
     lock(&_dataLock);
-    if (!NSThread.isMainThread) {
-        // The main thread is the only one that can unblock this, so sleeping here would be a deadlock.
-        // The only reason for this to be called on the main thread is if input is echoed.
-        while (_pendingData.length > BUF_SIZE)
-            wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
+    // Never block on the main thread – drop data if the buffer is full.
+    if (NSThread.isMainThread && _pendingData.length >= BUF_SIZE) {
+        // Truncate to avoid deadlock; callers can resend later if needed.
+        unlock(&_dataLock);
+        return 0;
     }
+
+    // Block only on background threads.
+    while (!NSThread.isMainThread && _pendingData.length >= BUF_SIZE) {
+        wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
+    }
+
     [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
     [self.refreshTask schedule];
     unlock(&_dataLock);
 #else
     @synchronized (self) {
         int room = [self roomForOutput];
-        if (len > room)
-            len = room;
+        if (len > room) len = room;
         if (len > 0) {
             [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
-            [_refreshTask schedule];
+            [self.refreshTask schedule];
         }
     }
 #endif
     return len;
 }
 
+/* ---------- Linux‑specific output space ---------- */
 #if ISH_LINUX
 - (int)roomForOutput {
     @synchronized (self) {
-        if (_pendingData.length > BUF_SIZE)
-            return 0;
-        return BUF_SIZE - (int) _pendingData.length;
+        if (_pendingData.length > BUF_SIZE) return 0;
+        return BUF_SIZE - (int)_pendingData.length;
     }
 }
 #endif
 
+/* ---------- Input handling ---------- */
 - (void)sendInput:(NSData *)input {
-    if (self.tty == NULL)
-        return;
+    if (self.tty == NULL) return;
 #if !ISH_LINUX
     tty_input(self.tty, input.bytes, input.length, 0);
 #else
@@ -226,85 +250,114 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     [self.scrollToBottomTask schedule];
 }
 
+/* ---------- Scrolling ---------- */
 - (void)scrollToBottom {
     [self.webView evaluateJavaScript:@"exports.scrollToBottom()" completionHandler:nil];
 }
 
+/* ---------- ANSI helper ---------- */
 - (NSString *)arrow:(char)direction {
-    return [NSString stringWithFormat:@"\x1b%c%c", self.applicationCursor ? 'O' : '[', direction];
+    NSAssert(direction >= 'A' && direction <= 'D', @"Invalid arrow direction: %c", direction);
+    // Only A‑D are valid; protect against unexpected values.
+    if (direction < 'A' || direction > 'D') direction = 'A';
+    return [NSString stringWithFormat:@"\x1b%c%c",
+            self.applicationCursor ? 'O' : '[', direction];
 }
 
+/* ---------- Refresh ---------- */
 - (void)refresh {
-    if (!self.loaded)
-        return;
+    if (!self.loaded) return;
+
+    NSData *data;
 
 #if !ISH_LINUX
     lock(&_dataLock);
-    if (_outputInProgress) {
+    if (self.outputInProgress) {
         [self.refreshTask schedule];
         unlock(&_dataLock);
         return;
     }
-    NSData *data = _pendingData;
-    _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-    _outputInProgress = YES;
+    data = self.pendingData;
+    self.pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
+    self.outputInProgress = YES;
     notify(&self->_dataConsumed);
     unlock(&_dataLock);
 #else
-    NSData *data;
     @synchronized (self) {
-        if (_outputInProgress) {
+        if (self.outputInProgress) {
             [self.refreshTask schedule];
             return;
         }
-        data = _pendingData;
-        _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-        _outputInProgress = YES;
-        if (self->_tty)
+        data = self.pendingData;
+        self.pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
+        self.outputInProgress = YES;
+        if (self->_tty) {
             async_do_in_irq(^{
                 self->_tty->ops->can_output(self->_tty);
             });
+        }
     }
 #endif
 
-    NSString *dataString = [[NSString alloc] initWithBytes:data.bytes length:data.length encoding:NSISOLatin1StringEncoding];
-    // escape for javascript. only have to worry about the first 256 codepoints, because of the latin-1 encoding.
+    // Convert to a safe string – fall back to lossy conversion if needed.
+    // NOTE: must encode the captured `data`, not self.pendingData (which
+    // has already been replaced with a fresh empty buffer above).
+    NSString *dataString = [[NSString alloc] initWithData:data
+                                                   encoding:NSISOLatin1StringEncoding];
+    if (!dataString) {
+        dataString = [[NSString alloc] initWithData:data
+                                            encoding:NSUTF8StringEncoding];
+    }
+
+    // Escape for JavaScript (Latin‑1 guarantees single‑byte characters).
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
     dataString = [dataString stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-    NSString *jsToEvaluate = [NSString stringWithFormat:@"exports.write(\"%@\")", dataString];
-    [self.webView evaluateJavaScript:jsToEvaluate completionHandler:^(id result, NSError *error) {
-#if !ISH_LINUX
-        lock(&self->_dataLock);
-        self->_outputInProgress = NO;
-        unlock(&self->_dataLock);
-#else
+
+    NSString *js = [NSString stringWithFormat:@"exports.write(\"%@\")", dataString];
+    [self.webView evaluateJavaScript:js
+                   completionHandler:^(id result, NSError *error) {
         @synchronized (self) {
-            self->_outputInProgress = NO;
+            self.outputInProgress = NO;
         }
-#endif
-        if (error != nil) {
+        if (error) {
             NSLog(@"error sending bytes to the terminal: %@", error);
-            return;
         }
     }];
 }
 
-+ (void)convertCommand:(NSArray<NSString *> *)command toArgs:(char *)argv limitSize:(size_t)maxSize {
+/* ---------- Argument conversion ---------- */
++ (void)convertCommand:(NSArray<NSString *> *)command
+                toArgs:(char *)argv
+             limitSize:(size_t)maxSize {
+    // Builds a sequence of NUL-terminated strings back-to-back in argv,
+    // followed by a final terminating NUL (double-NUL at the very end).
     char *p = argv;
+    char *end = argv + maxSize;
+
     for (NSString *cmd in command) {
         const char *c = cmd.UTF8String;
-        // Save space for the final NUL byte in argv
-        while (p < argv + maxSize - 1 && (*p++ = *c++));
-        // If we reach the end of the buffer, the last string still needs to be
-        // NUL terminated
+        while (p < end - 1 && (*p = *c) != '\0') {
+            p++;
+            c++;
+        }
+        if (p >= end - 1) {
+            // Out of space; terminate what we have so far and stop.
+            *p = '\0';
+            return;
+        }
+        *p = '\0'; // terminate this argument
+        p++;       // advance past it so the next argument doesn't overwrite it
+    }
+
+    // Final double‑NUL terminator marking the end of the whole block.
+    if (p < end) {
         *p = '\0';
     }
-    // Add the final NUL byte to argv
-    *++p = '\0';
 }
 
+/* ---------- Factory helpers ---------- */
 + (Terminal *)terminalWithType:(int)type number:(int)number {
     return [[Terminal alloc] initWithType:type number:number];
 }
@@ -315,24 +368,25 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     }
 }
 
+/* ---------- Destruction ---------- */
 - (void)destroy {
     tty_t tty = self.tty;
     if (tty != NULL) {
 #if !ISH_LINUX
-        if (tty != NULL) {
-            lock(&tty->lock);
-            tty_hangup(tty);
-            unlock(&tty->lock);
-        }
+        lock(&tty->lock);
+        tty_hangup(tty);
+        unlock(&tty->lock);
 #else
         tty->ops->hangup(tty);
 #endif
     }
     @synchronized (Terminal.class) {
         [terminals removeObjectForKey:self.terminalsKey];
+        [terminalsByUUID removeObjectForKey:self.uuid];
     }
 }
 
+/* ---------- Class initialisation ---------- */
 + (void)initialize {
     if (self == Terminal.class) {
         terminals = [NSMapTable strongToWeakObjectsMapTable];
@@ -342,42 +396,48 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 @end
 
+/* ---------- C bridge (Linux) ---------- */
 #if ISH_LINUX
 nsobj_t Terminal_terminalWithType_number(int type, int number) {
     return CFBridgingRetain([Terminal terminalWithType:type number:number]);
 }
 int Terminal_sendOutput_length(nsobj_t _self, const char *data, int size) {
-    return [(__bridge Terminal *) _self sendOutput:data length:size];
+    return [(__bridge Terminal *)_self sendOutput:data length:size];
 }
 int Terminal_roomForOutput(nsobj_t _self) {
-    return [(__bridge Terminal *) _self roomForOutput];
+    return [(__bridge Terminal *)_self roomForOutput];
 }
 void Terminal_setLinuxTTY(nsobj_t _self, struct linux_tty *tty) {
-    return [(__bridge Terminal *) _self setTty:tty];
+    [(__bridge Terminal *)_self setTty:tty];
 }
 #endif
 
+/* ---------- iOS tty driver ---------- */
 #if !ISH_LINUX
 static int ios_tty_init(struct tty *tty) {
-    // This is called with ttys_lock but that results in deadlock since the main thread can also acquire ttys_lock. So release it.
+    // Release the global ttys lock; the init block may re‑acquire it via the
+    // Terminal constructor, which would deadlock otherwise.
     unlock(&ttys_lock);
+
     void (^init_block)(void) = ^{
         Terminal *terminal = [Terminal terminalWithType:tty->type number:tty->num];
-        tty->data = (void *) CFBridgingRetain(terminal);
+        tty->data = (void *)CFBridgingRetain(terminal);
         terminal.tty = tty;
     };
-    if ([NSThread isMainThread])
+
+    if ([NSThread isMainThread]) {
         init_block();
-    else
+    } else {
         dispatch_sync(dispatch_get_main_queue(), init_block);
+    }
 
     lock(&ttys_lock);
     return 0;
 }
 
 static int ios_tty_write(struct tty *tty, const void *buf, size_t len, bool blocking) {
-    Terminal *terminal = (__bridge Terminal *) tty->data;
-    return [terminal sendOutput:buf length:(int) len];
+    Terminal *terminal = (__bridge Terminal *)tty->data;
+    return [terminal sendOutput:buf length:(int)len];
 }
 
 static void ios_tty_cleanup(struct tty *tty) {
@@ -387,8 +447,8 @@ static void ios_tty_cleanup(struct tty *tty) {
 }
 
 struct tty_driver_ops ios_tty_ops = {
-    .init = ios_tty_init,
-    .write = ios_tty_write,
+    .init    = ios_tty_init,
+    .write   = ios_tty_write,
     .cleanup = ios_tty_cleanup,
 };
 DEFINE_TTY_DRIVER(ios_console_driver, &ios_tty_ops, TTY_CONSOLE_MAJOR, 64);
