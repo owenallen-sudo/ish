@@ -339,6 +339,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         if (error) {
             NSLog(@"error sending bytes to the terminal: %@", error);
         }
+        [self.scrollToBottomTask schedule];
     }];
 }
 
