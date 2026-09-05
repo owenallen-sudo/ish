@@ -62,9 +62,8 @@ function syncProp(name, value) {
     if (oldProps[name] !== value)
         native.propUpdate(name, value);
 }
-let decoder = new TextDecoder();
 exports.write = (data) => {
-    term.io.writeUTF16(decoder.decode(lib.codec.stringToCodeUnitArray(data)));
+    term.io.writeUTF16(data);
     syncProp('applicationCursor', term.keyboard.applicationCursor);
 };
 term.io.sendString = term.io.onVTKeyStroke = (data) => {
