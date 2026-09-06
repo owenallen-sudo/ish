@@ -9,6 +9,7 @@
     sub esp, esp, 4
     gret 1
     write_bullshit 32, push
+
 .gadget pop
     mov _addr, esp
     read_prep 32, pop
@@ -25,6 +26,7 @@
 .endm
 .each_reg x
 .purgem x
+
 .gadget addr_none
     ldr _addr, [_ip]
     gret 1
@@ -35,13 +37,17 @@
         .gadget si_\name\()_\times
             .ifc \times,1
                 add _addr, _addr, \reg
-            .else N .ifc \times,2
-                add _addr, _addr, \reg, lsl 1
-            .else N .ifc \times,4
-                add _addr, _addr, \reg, lsl 2
-            .else N .ifc \times,8
-                add _addr, _addr, \reg, lsl 3
-            .endif N .endif N .endif N .endif
+            .else
+                .ifc \times,2
+                    add _addr, _addr, \reg, lsl 1
+                .else
+                    .ifc \times,4
+                        add _addr, _addr, \reg, lsl 2
+                    .else
+                        add _addr, _addr, \reg, lsl 3
+                    .endif
+                .endif
+            .endif
             gret
     .endr
 .endm
@@ -64,7 +70,6 @@ NAME(si_gadgets):
     gret
 
 .irp type, read,write
-
 .global handle_\type\()_miss
 handle_\type\()_miss:
     save_c
@@ -77,10 +82,10 @@ handle_\type\()_miss:
         mov x2, 1
     .endif
     bl NAME(tlb_handle_miss)
-    mov x19, x0
+    mov x20, x0
     restore_c
-    cbz x19, segfault_\type
-    mov _xaddr, x19
+    cbz x20, segfault_\type
+    mov _xaddr, x20
     ret
 
 .global segfault_\type
@@ -100,7 +105,6 @@ segfault_\type:
     csel esp, esp, w8, eq
     mov x0, INT_GPF
     b fiber_exit
-
 .endr
 
 .global crosspage_load
@@ -111,22 +115,23 @@ crosspage_load:
     mov w1, _addr
     mov x3, x19
     bl NAME(__tlb_read_cross_page)
-    mov x19, x0
+    mov x20, x0
     restore_c
-    cbz x19, segfault_read
+    cbz x20, segfault_read
     str _addr, [_cpu, LOCAL_value_addr]
     add _xaddr, _cpu, LOCAL_value
     ret
 
 .global crosspage_store
 crosspage_store:
+    str _addr, [_cpu, LOCAL_value_addr]
     save_c
     sub x0, _tlb, TLB_entries
     add x2, _cpu, LOCAL_value
     ldr w1, [_cpu, LOCAL_value_addr]
     mov x3, x19
     bl NAME(__tlb_write_cross_page)
-    mov x19, x0
+    mov x20, x0
     restore_c
-    cbz x19, segfault_write
+    cbz x20, segfault_write
     ret

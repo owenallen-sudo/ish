@@ -3,7 +3,6 @@
 //  iSH
 //
 //  Created by Theodore Dubois on 10/18/17.
-//  Modified by Owen Allen on 5/7/26
 //
 
 #import "Terminal.h"
