@@ -247,7 +247,7 @@ do_helper 2
             add x2, x0, x2
         .endif
 
-        .ifc _imm,_imm
+        .ifc \_imm,_imm
             # imm for third argument
             .ifin(\rm, reg)
                 ldr w3, [_ip, 12]
