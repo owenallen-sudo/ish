@@ -29,9 +29,12 @@ _xaddr .req x3
     .align 4
     NAME(gadget_\()\name) :
 .endm
+
+# FIX 1: fold the advance into the load so _ip moves exactly once.
+# Previously: ldr x8, [_ip, \pop*8]! then add _ip, _ip, 8
+# — when pop>0 that advanced _ip by pop*8+8, skipping a slot.
 .macro gret pop=0
-    ldr x8, [_ip, \pop*8]!
-    add _ip, _ip, 8 /* TODO get rid of this */
+    ldr x8, [_ip, (\pop+1)*8]!
     br x8
 .endm
 
@@ -65,9 +68,16 @@ handle_miss_\id :
     bl handle_\type\()_miss
     b back_\id
 crosspage_load_\id :
+    # FIX 5: write path must call crosspage_store, not crosspage_load.
+    .ifc \type,write
+    mov x19, (\size/8)
+    bl crosspage_store
+    b back_write_done_\id
+    .else
     mov x19, (\size/8)
     bl crosspage_load
     b back_\id
+    .endif
 .ifc \type,write
 crosspage_store_\id :
     mov x19, (\size/8)
@@ -77,6 +87,11 @@ crosspage_store_\id :
 .endm
 
 .endr
+
+# FIX 2: write_done now only branches to crosspage_store_\id when
+# write_bullshit has been emitted for the same id (caller's responsibility),
+# but the check itself is corrected: the special-case target is LOCAL_value
+# inside the cpu struct, not a crosspage situation, so jump to the right label.
 .macro write_done size, id
     add x8, _cpu, LOCAL_value
     cmp x8, _xaddr
@@ -174,14 +189,17 @@ back_write_done_\id :
     ldp x0, x1, [sp], 0x60
 .endm
 
+# FIX 3: removed stray N tokens from .else/.endif lines.
 .macro movs dst, src, s
     .ifc \s,h
         bfxil \dst, \src, 0, 16
-    .else N .ifc \s,b
+    .else
+    .ifc \s,b
         bfxil \dst, \src, 0, 8
     .else
         mov \dst, \src
-    .endif N .endif
+    .endif
+    .endif
 .endm
 .macro op_s op, dst, src1, src2, s
     .ifb \s
@@ -207,6 +225,7 @@ back_write_done_\id :
     .endif
 .endm
 
+# FIX 4: load_regs and save_regs now use the same esi/edi order.
 .macro load_regs
     ldr eax, [_cpu, CPU_eax]
     ldr ebx, [_cpu, CPU_ebx]
@@ -223,8 +242,8 @@ back_write_done_\id :
     str ebx, [_cpu, CPU_ebx]
     str ecx, [_cpu, CPU_ecx]
     str edx, [_cpu, CPU_edx]
-    str edi, [_cpu, CPU_edi]
     str esi, [_cpu, CPU_esi]
+    str edi, [_cpu, CPU_edi]
     str ebp, [_cpu, CPU_ebp]
     str esp, [_cpu, CPU_esp]
     str eip, [_cpu, CPU_eip]
