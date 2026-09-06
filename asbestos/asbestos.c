@@ -41,31 +41,38 @@ void asbestos_free(struct asbestos *asbestos) {
 }
 
 static inline struct list *blocks_list(struct asbestos *asbestos, page_t page, int i) {
-    // TODO is this a good hash function?
     return &asbestos->page_hash[page % FIBER_PAGE_HASH_SIZE].blocks[i];
 }
 
-void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t end) {
-    lock(&absestos->lock);
-    struct fiber_block *block, *tmp;
-    for (page_t page = start; page < end; page++) {
+void asbestos_invalidate_range(struct asbestos *asbestos, page_t start, page_t end) {
+    lock(&asbestos->lock);
+    for (page_t p = start; p < end; p++) {
         for (int i = 0; i <= 1; i++) {
-            struct list *blocks = blocks_list(absestos, page, i);
+            struct list *blocks = blocks_list(asbestos, p, i);
             if (list_null(blocks))
                 continue;
-            list_for_each_entry_safe(blocks, block, tmp, page[i]) {
-                fiber_block_disconnect(absestos, block);
+
+            struct list *curr = blocks->next;
+            while (curr != blocks) {
+                // Calculate the block pointer from the list element using the offset of page[i]
+                struct fiber_block *block = list_entry(curr, struct fiber_block, page[i]);
+                struct list *next_node = curr->next;
+
+                fiber_block_disconnect(asbestos, block);
                 block->is_jetsam = true;
-                list_add(&absestos->jetsam, &block->jetsam);
+                list_add(&asbestos->jetsam, &block->jetsam);
+                
+                curr = next_node;
             }
         }
     }
-    unlock(&absestos->lock);
+    unlock(&asbestos->lock);
 }
 
 void asbestos_invalidate_page(struct asbestos *asbestos, page_t page) {
     asbestos_invalidate_range(asbestos, page, page + 1);
 }
+
 void asbestos_invalidate_all(struct asbestos *asbestos) {
     asbestos_invalidate_range(asbestos, 0, MEM_PAGES);
 }
@@ -90,7 +97,6 @@ static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
 static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
     asbestos->mem_used += block->used;
     asbestos->num_blocks++;
-    // target an average hash chain length of 1-2
     if (asbestos->num_blocks >= asbestos->hash_size * 2)
         fiber_resize_hash(asbestos, asbestos->hash_size * 2);
 
@@ -119,11 +125,6 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     while (true) {
         if (!gen_step(&state, tlb))
             break;
-        // no block should span more than 2 pages
-        // guarantee this by limiting total block size to 1 page
-        // guarantee that by stopping as soon as there's less space left than
-        // the maximum length of an x86 instruction
-        // TODO refuse to decode instructions longer than 15 bytes
         if (state.ip - ip >= PAGE_SIZE - 15) {
             gen_exit(&state);
             break;
@@ -135,8 +136,6 @@ static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     return state.block;
 }
 
-// Remove all pointers to the block. It can't be freed yet because another
-// thread may be executing it.
 static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block *block) {
     if (asbestos != NULL) {
         asbestos->mem_used -= block->used;
@@ -179,64 +178,54 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     struct asbestos *asbestos = cpu->mmu->asbestos;
     read_wrlock(&asbestos->jetsam_lock);
 
+    // FIX: Allocated on stack to avoid heap churn
+    struct fiber_frame frame = {0};
+    frame.cpu = *cpu;
+    
+    // FIX: Allocate cache once per interruption cycle, not inside the while loop
     struct fiber_block **cache = calloc(FIBER_CACHE_SIZE, sizeof(*cache));
-    struct fiber_frame *frame = malloc(sizeof(struct fiber_frame));
-    memset(frame, 0, sizeof(*frame));
-    frame->cpu = *cpu;
+    
     assert(asbestos->mmu == cpu->mmu);
 
     int interrupt = INT_NONE;
     while (interrupt == INT_NONE) {
-        addr_t ip = frame->cpu.eip;
+        addr_t ip = frame.cpu.eip;
         size_t cache_index = fiber_cache_hash(ip);
         struct fiber_block *block = cache[cache_index];
-        if (block == NULL || block->addr != ip) {
-            lock(&asbestos->lock);
-            block = fiber_lookup(asbestos, ip);
-            if (block == NULL) {
-                block = fiber_block_compile(ip, tlb);
-                fiber_insert(asbestos, block);
-            } else {
-                TRACE("%d %08x --- missed cache\n", current_pid(), ip);
-            }
-            cache[cache_index] = block;
-            unlock(&asbestos->lock);
+        
+    if (block == NULL || block->addr != ip || block->is_jetsam) {
+        lock(&asbestos->lock);
+        block = fiber_lookup(asbestos, ip);
+        if (block == NULL) {
+            block = fiber_block_compile(ip, tlb);
+            fiber_insert(asbestos, block);
         }
-        struct fiber_block *last_block = frame->last_block;
-        if (last_block != NULL &&
-                (last_block->jump_ip[0] != NULL ||
-                 last_block->jump_ip[1] != NULL)) {
+    cache[cache_index] = block;
+    unlock(&asbestos->lock);
+    }
+        struct fiber_block *last_block = frame.last_block;
+        if (last_block != NULL && (last_block->jump_ip[0] != NULL || last_block->jump_ip[1] != NULL)) {
             lock(&asbestos->lock);
-            // can't mint new pointers to a block that has been marked jetsam
-            // and is thus assumed to have no pointers left
             if (!last_block->is_jetsam && !block->is_jetsam) {
                 for (int i = 0; i <= 1; i++) {
-                    if (last_block->jump_ip[i] != NULL &&
-                            (*last_block->jump_ip[i] & 0xffffffff) == block->addr) {
+                    if (last_block->jump_ip[i] != NULL && (*last_block->jump_ip[i] & 0xffffffff) == block->addr) {
                         *last_block->jump_ip[i] = (unsigned long) block->code;
                         list_add(&block->jumps_from[i], &last_block->jumps_from_links[i]);
                     }
                 }
             }
-
             unlock(&asbestos->lock);
         }
-        frame->last_block = block;
+        frame.last_block = block;
 
-        // block may be jetsam, but that's ok, because it can't be freed until
-        // every thread on this asbestos is not executing anything
-
-        TRACE("%d %08x --- cycle %ld\n", current_pid(), ip, frame->cpu.cycle);
-
-        interrupt = fiber_enter(block, frame, tlb);
+        interrupt = fiber_enter(block, &frame, tlb);
         if (interrupt == INT_NONE && __atomic_exchange_n(cpu->poked_ptr, false, __ATOMIC_SEQ_CST))
             interrupt = INT_TIMER;
-        if (interrupt == INT_NONE && ++frame->cpu.cycle % (1 << 10) == 0)
+        if (interrupt == INT_NONE && ++frame.cpu.cycle % (1 << 10) == 0)
             interrupt = INT_TIMER;
-        *cpu = frame->cpu;
+        *cpu = frame.cpu;
     }
 
-    free(frame);
     free(cache);
     read_wrunlock(&asbestos->jetsam_lock);
     return interrupt;
@@ -269,9 +258,6 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     struct asbestos *asbestos = cpu->mmu->asbestos;
     lock(&asbestos->lock);
     if (!list_empty(&asbestos->jetsam)) {
-        // write-lock the jetsam_lock to wait until other asbestos threads get
-        // to this point, so they will all clear out their block pointers
-        // TODO: use RCU for better performance
         unlock(&asbestos->lock);
         write_wrlock(&asbestos->jetsam_lock);
         lock(&asbestos->lock);
