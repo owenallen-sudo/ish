@@ -23,12 +23,11 @@ fiber_ret_chain:
     b.lt fiber_ret
     ldr x8, [_cpu, CPU_poked_ptr]
     ldrb w8, [x8]
+    sub x9, _ip, FIBER_BLOCK_code
+    str x9, [_cpu, LOCAL_last_block]
     cmp w8, 0
     b.ne poke
-    sub x8, _ip, FIBER_BLOCK_code
-    str x8, [_cpu, LOCAL_last_block]
     gret
-
 poke:
     ldr eip, [_ip, -FIBER_BLOCK_code+FIBER_BLOCK_addr]
     # fallthrough

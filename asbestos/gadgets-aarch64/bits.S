@@ -102,6 +102,12 @@
                 .elseif \size == 16
                     subs w10, w8, \size+1
                     csel w8, w10, w8, gt
+                .elseif \size == 32
+                    # mod 33: max value after masking is 31, which is < 33,
+                    # so no reduction is ever needed. But we keep this branch
+                    # explicit for correctness and in case the mask changes.
+                    subs w10, w8, \size+1
+                    csel w8, w10, w8, gt
                 .endif
                 mov w9, \size+1
                 sub w9, w9, w8
