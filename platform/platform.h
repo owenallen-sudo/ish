@@ -36,7 +36,4 @@ struct uptime_info {
 
 platform_error_t get_uptime(struct uptime_info *info);
 
-int validate_cpu_usage(const struct cpu_usage *usage);
-int validate_mem_usage(const struct mem_usage *usage);
-
 #endif
