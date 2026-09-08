@@ -28,7 +28,8 @@
 extern void run_kernel(void);
 
 void actuate_kernel(const char *cmdline) {
-    strcpy(boot_command_line, cmdline);
+    strncpy(boot_command_line, cmdline, sizeof(boot_command_line) - 1);
+    boot_command_line[sizeof(boot_command_line) - 1] = '\0';
     run_kernel();
 }
 
@@ -153,11 +154,17 @@ void linux_start_session(const char *exe, const char *const *argv, const char *c
 }
 
 void linux_sethostname(const char *hostname) {
+    if (!hostname)
+        return;
     int len = strlen(hostname);
     if (len > __NEW_UTS_LEN)
         len = __NEW_UTS_LEN;
     down_write(&uts_sem);
     struct new_utsname *u = utsname();
+    if (!u) {
+        up_write(&uts_sem);
+        return;
+    }
     if (strncmp(u->nodename, hostname, len) != 0) {
         memcpy(u->nodename, hostname, len);
         memset(u->nodename + len, 0, sizeof(u->nodename) - len);
@@ -167,21 +174,29 @@ void linux_sethostname(const char *hostname) {
 }
 
 ssize_t linux_read_file(const char *path, char *buf, size_t size) {
+    if (!buf || size == 0)
+        return -EINVAL;
     struct file *filp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(filp))
         return PTR_ERR(filp);
-    ssize_t res = vfs_read(filp, buf, size, NULL);
+    ssize_t res = vfs_read(filp, (void __user *)buf, size - 1, NULL);
     filp_close(filp, NULL);
-    if (res >= size)
-        return -ENAMETOOLONG;
+    if (res > 0)
+        buf[res] = '\0';
     return res;
 }
+
 ssize_t linux_write_file(const char *path, const char *buf, size_t size) {
-    struct file *filp = filp_open(path, O_WRONLY, 0);
-    ssize_t res = vfs_write(filp, buf, size, NULL);
+    if (!buf || !path)
+        return -EINVAL;
+    struct file *filp = filp_open(path, O_WRONLY | O_CREAT, 0644);
+    if (IS_ERR(filp))
+        return PTR_ERR(filp);
+    ssize_t res = vfs_write(filp, (const void __user *)buf, size, NULL);
     filp_close(filp, NULL);
     return res;
 }
+
 int linux_remove_directory(const char *path) {
     return init_rmdir(path);
 }
