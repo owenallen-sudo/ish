@@ -27,10 +27,14 @@
 
 extern void run_kernel(void);
 
-void actuate_kernel(const char *cmdline) {
-    strncpy(boot_command_line, cmdline, sizeof(boot_command_line) - 1);
-    boot_command_line[sizeof(boot_command_line) - 1] = '\0';
-    run_kernel();
+int actuate_kernel(const char *cmdline) {
+    if (!cmdline)
+        return -EINVAL;
+    size_t len = strlen(cmdline);
+    if (len >= sizeof(boot_command_line))
+        return -ENAMETOOLONG;
+    strlcpy(boot_command_line, cmdline, sizeof(boot_command_line));
+    return 0;
 }
 
 static int panic_report(struct notifier_block *nb, unsigned long action, void *data) {
@@ -53,24 +57,33 @@ core_initcall(panic_report_init);
 
 static int block_request_read;
 static int block_request_write;
+static DEFINE_SPINLOCK(block_request_lock);
 static irqreturn_t call_block_irq(int irq, void *dev) {
-    void (^block)(void);
+    void (^block)(void) = NULL;
     for (;;) {
         int err = host_read(block_request_read, &block, sizeof(block));
         if (err <= 0)
             break;
-        block();
-        Block_release(block);
+        if (block) {
+            block();
+            Block_release(block);
+        }
     }
     return IRQ_HANDLED;
 }
 
-void async_do_in_irq(void (^block)(void)) {
+int async_do_in_irq(void (^block)(void)) {
     block = Block_copy(block);
+    unsigned long flags;
+    spin_lock_irqsave(&block_request_lock, flags);
     int err = host_write(block_request_write, &block, sizeof(block));
-    if (err < 0)
-        __builtin_trap();
-    trigger_irq(CALL_BLOCK_IRQ);
+    spin_unlock_irqrestore(&block_request_lock, flags);
+    
+    if (err < 0) {
+        Block_release(block);
+        return err;
+    }
+    return 0;
 }
 
 struct ios_work {
@@ -86,8 +99,13 @@ static void do_ios_work(struct work_struct *work) {
 }
 
 void async_do_in_workqueue(void (^block)(void)) {
+    block = Block_copy(block);
     async_do_in_irq(^{
         struct ios_work *work = kzalloc(sizeof(*work), GFP_ATOMIC);
+        if (!work) {
+            Block_release(block);
+            return;
+        }
         work->block = Block_copy(block);
         INIT_WORK(&work->work, do_ios_work);
         schedule_work(&work->work);
@@ -99,11 +117,18 @@ static int __init call_block_init(void) {
     if (err < 0)
         return err;
     err = fd_set_nonblock(block_request_read);
-    if (err < 0)
+    if (err < 0) {
+        host_close(block_request_read);
+        host_close(block_request_write);
         return err;
+    }
+
     err = request_irq(CALL_BLOCK_IRQ, call_block_irq, 0, "block", NULL);
-    if (err < 0)
+    if (err < 0) {
+        host_close(block_request_read);
+        host_close(block_request_write);
         return err;
+    }
     return 0;
 }
 subsys_initcall(call_block_init);
@@ -134,65 +159,99 @@ static int session_init(struct subprocess_info *info, struct cred *cred) {
 
 static void session_cleanup(struct subprocess_info *info) {
     struct ish_session *session = info->data;
-    if (session->pid != 0 || info->retval != 0)
-        session->callback(info->retval, session->pid, objc_get(session->terminal));
-    else; // otherwise, there was a synchronous failure, returned directly from call_usermodehelper_exec
+    int reported_pid = (info->retval == 0) ? session->pid : 0;
+    session->callback(info->retval, reported_pid, objc_get(session->terminal));
+    
     if (session->tty != NULL)
         fput(session->tty);
     objc_put(session->terminal);
     kfree(session);
 }
 
-void linux_start_session(const char *exe, const char *const *argv, const char *const *envp, StartSessionDoneBlock done) {
+int linux_start_session(const char *exe, const char *const *argv, const char *const *envp, StartSessionDoneBlock done) {
+    if (!exe || !argv || !done)
+        return -EINVAL;
+    
     struct ish_session *session = kzalloc(sizeof(*session), GFP_KERNEL);
+    if (!session)
+        return -ENOMEM;
+    
     session->tty = ios_pty_open(&session->terminal);
+    if (!session->tty) {
+        kfree(session);
+        return -EIO;
+    }
+    
     session->callback = done;
     struct subprocess_info *proc = call_usermodehelper_setup(exe, (char **) argv, (char **) envp, GFP_KERNEL, session_init, session_cleanup, session);
+    if (!proc) {
+        done(-ENOMEM, 0, NULL);
+        objc_put(session->terminal);
+        fput(session->tty);
+        kfree(session);
+        return -ENOMEM;
+    }
+    
     int err = call_usermodehelper_exec(proc, UMH_WAIT_EXEC);
-    if (err < 0)
+    if (err < 0) {
         done(err, 0, NULL);
+        objc_put(session->terminal);
+        if (session->tty)
+            fput(session->tty);
+        kfree(session);
+        return err;
+    }
+    
+    return 0;
 }
 
-void linux_sethostname(const char *hostname) {
+int linux_sethostname(const char *hostname) {
     if (!hostname)
-        return;
-    int len = strlen(hostname);
+        return -EINVAL;
+    
+    size_t len = strlen(hostname);
     if (len > __NEW_UTS_LEN)
-        len = __NEW_UTS_LEN;
+        return -ENAMETOOLONG;
+    
     down_write(&uts_sem);
     struct new_utsname *u = utsname();
     if (!u) {
         up_write(&uts_sem);
-        return;
+        return -EFAULT;
     }
+    
     if (strncmp(u->nodename, hostname, len) != 0) {
-        memcpy(u->nodename, hostname, len);
-        memset(u->nodename + len, 0, sizeof(u->nodename) - len);
+        strlcpy(u->nodename, hostname, __NEW_UTS_LEN);
         uts_proc_notify(UTS_PROC_HOSTNAME);
     }
     up_write(&uts_sem);
+    return 0;
 }
 
 ssize_t linux_read_file(const char *path, char *buf, size_t size) {
-    if (!buf || size == 0)
+    if (!path || !buf || size == 0)
         return -EINVAL;
     struct file *filp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(filp))
         return PTR_ERR(filp);
-    ssize_t res = vfs_read(filp, (void __user *)buf, size - 1, NULL);
+    ssize_t res = kernel_read(filp, buf, size - 1, NULL);
     filp_close(filp, NULL);
-    if (res > 0)
+    if (res > 0) {
         buf[res] = '\0';
+    } else if (res == 0) {
+        buf[0] = '\0';
+    }
     return res;
 }
 
 ssize_t linux_write_file(const char *path, const char *buf, size_t size) {
-    if (!buf || !path)
+    if (!buf || !path || size == 0)
         return -EINVAL;
-    struct file *filp = filp_open(path, O_WRONLY | O_CREAT, 0644);
+    struct file *filp = filp_open(path, O_WRONLY | O_CREAT |  O_TRUNC, 0644);
     if (IS_ERR(filp))
         return PTR_ERR(filp);
-    ssize_t res = vfs_write(filp, (const void __user *)buf, size, NULL);
+    loff_t pos = 0;
+    ssize_t res = kernel_write(filp, buf, size, &pos);
     filp_close(filp, NULL);
     return res;
 }
