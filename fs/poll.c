@@ -242,6 +242,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 if (callback(context, poll_types, poll_fd->info) == 1)
                     res++;
 
+                if (poll_fd->types & POLL_EDGETRIGGERED) {
+                    poll_fd->triggered_types |= poll_types;
+                }
+
                 // The real poll does not actually get the FDs set as oneshot.
                 // But this loop is done while holding the lock, so only one
                 // thread can get each oneshot event. This doesn't solve the
@@ -254,10 +258,6 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                         real_poll_update(&poll_->real, fd->real_fd, 0, NULL);
                     }
                     free(poll_fd);
-                }
-
-                if (poll_fd->types & POLL_EDGETRIGGERED) {
-                    poll_fd->triggered_types |= poll_types;
                 }
             }
         }

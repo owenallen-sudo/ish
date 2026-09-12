@@ -259,7 +259,13 @@ void dump_stack(int lines);
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
-        unsigned syscall_num = cpu->eax;
+        if ((int)cpu->eax < 0) {
+            printk("%d(%s) invalid syscall number %d\n", current->pid, current->comm, (int)cpu->eax);
+            cpu->eax = _ENOSYS;
+            break;
+        }
+        int syscall_num = (int)cpu->eax;
+
         if (syscall_num >= NUM_SYSCALLS || syscall_table[syscall_num] == NULL) {
             printk("%d(%s) missing syscall %d\n", current->pid, current->comm, syscall_num);
             cpu->eax = _ENOSYS;

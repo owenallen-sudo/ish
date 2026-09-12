@@ -5,14 +5,19 @@ on:
 jobs:
   label:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
-      - uses: satackey/action-js-inline@bf6fcaf35de1ed03bcfd25a0a8b1fa4c551ec908
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/github-script@v7
         with:
           script: |
-            const core = require('@actions/core');
-            const github = require('@actions/github');
-            const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
-            const {repo, owner, number} = github.context.issue;
-            await octokit.rest.issues.addLabels({repo, owner, issue_number: number, labels: ['unconfirmed']});
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['unconfirmed']
+              });
+            } catch (error) {
+              core.setFailed(`Failed to add label: ${error.message}`);
+            }
